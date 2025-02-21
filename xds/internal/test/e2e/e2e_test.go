@@ -59,11 +59,10 @@ func setup(t *testing.T, opts testOpts) (*controlPlane, *client, []*server) {
 		backendCount = opts.backendCount
 	}
 
-	cp, err := newControlPlane()
+	cp, err := newControlPlane(t)
 	if err != nil {
 		t.Fatalf("failed to start control-plane: %v", err)
 	}
-	t.Cleanup(cp.stop)
 
 	var clientLog bytes.Buffer
 	c, err := newClient(fmt.Sprintf("xds:///%s", opts.testName), *clientPath, cp.bootstrapContent, &clientLog, opts.clientFlags...)
@@ -123,6 +122,7 @@ func TestPingPong(t *testing.T) {
 // - verify that
 //   - all RPCs with the same metadata value are sent to the same backend
 //   - only one backend is Ready
+//
 // - send more RPCs with different metadata values until a new backend is picked, and verify that
 //   - only two backends are in Ready
 func TestAffinity(t *testing.T) {

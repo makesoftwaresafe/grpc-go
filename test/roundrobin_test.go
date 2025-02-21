@@ -20,7 +20,6 @@ package test
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,69 +31,31 @@ import (
 	"google.golang.org/grpc/internal/channelz"
 	imetadata "google.golang.org/grpc/internal/metadata"
 	"google.golang.org/grpc/internal/stubserver"
+	"google.golang.org/grpc/internal/testutils"
+	rrutil "google.golang.org/grpc/internal/testutils/roundrobin"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
-	testgrpc "google.golang.org/grpc/test/grpc_testing"
-	testpb "google.golang.org/grpc/test/grpc_testing"
+
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 const rrServiceConfig = `{"loadBalancingConfig": [{"round_robin":{}}]}`
 
-func checkRoundRobin(ctx context.Context, cc *grpc.ClientConn, addrs []resolver.Address) error {
-	client := testgrpc.NewTestServiceClient(cc)
-	// Make sure connections to all backends are up.
-	backendCount := len(addrs)
-	for i := 0; i < backendCount; i++ {
-		for {
-			time.Sleep(time.Millisecond)
-			if ctx.Err() != nil {
-				return fmt.Errorf("timeout waiting for connection to %q to be up", addrs[i].Addr)
-			}
-			var peer peer.Peer
-			if _, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&peer)); err != nil {
-				// Some tests remove backends and check if round robin is happening
-				// across the remaining backends. In such cases, RPCs can initially fail
-				// on the connection using the removed backend. Just keep retrying and
-				// eventually the connection using the removed backend will shutdown and
-				// will be removed.
-				continue
-			}
-			if peer.Addr.String() == addrs[i].Addr {
-				break
-			}
-		}
-	}
-	// Make sure RPCs are sent to all backends.
-	for i := 0; i < 3*backendCount; i++ {
-		var peer peer.Peer
-		if _, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.Peer(&peer)); err != nil {
-			return fmt.Errorf("EmptyCall() = %v, want <nil>", err)
-		}
-		if gotPeer, wantPeer := peer.Addr.String(), addrs[i%backendCount].Addr; gotPeer != wantPeer {
-			return fmt.Errorf("rpc sent to peer %q, want peer %q", gotPeer, wantPeer)
-		}
-	}
-	return nil
-}
-
 func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOption) (*grpc.ClientConn, *manual.Resolver, []*stubserver.StubServer) {
 	t.Helper()
-
-	// Initialize channelz. Used to determine pending RPC count.
-	czCleanup := channelz.NewChannelzStorageForTesting()
-	t.Cleanup(func() { czCleanupWrapper(czCleanup, t) })
 
 	r := manual.NewBuilderWithScheme("whatever")
 
 	const backendCount = 5
 	backends := make([]*stubserver.StubServer, backendCount)
+	endpoints := make([]resolver.Endpoint, backendCount)
 	addrs := make([]resolver.Address, backendCount)
 	for i := 0; i < backendCount; i++ {
 		backend := &stubserver.StubServer{
-			EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) { return &testpb.Empty{}, nil },
+			EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) { return &testpb.Empty{}, nil },
 		}
 		if err := backend.StartServer(); err != nil {
 			t.Fatalf("Failed to start backend: %v", err)
@@ -104,6 +65,7 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 
 		backends[i] = backend
 		addrs[i] = resolver.Address{Addr: backend.Address}
+		endpoints[i] = resolver.Endpoint{Addresses: []resolver.Address{addrs[i]}}
 	}
 
 	dopts := []grpc.DialOption{
@@ -112,12 +74,12 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 		grpc.WithDefaultServiceConfig(rrServiceConfig),
 	}
 	dopts = append(dopts, opts...)
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	t.Cleanup(func() { cc.Close() })
-	client := testpb.NewTestServiceClient(cc)
+	client := testgrpc.NewTestServiceClient(cc)
 
 	// At this point, the resolver has not returned any addresses to the channel.
 	// This RPC must block until the context expires.
@@ -128,7 +90,7 @@ func testRoundRobinBasic(ctx context.Context, t *testing.T, opts ...grpc.DialOpt
 	}
 
 	r.UpdateState(resolver.State{Addresses: addrs})
-	if err := checkRoundRobin(ctx, cc, addrs); err != nil {
+	if err := rrutil.CheckRoundRobinRPCs(ctx, client, addrs); err != nil {
 		t.Fatal(err)
 	}
 	return cc, r, backends
@@ -155,15 +117,11 @@ func (s) TestRoundRobin_AddressesRemoved(t *testing.T) {
 
 	// Send a resolver update with no addresses. This should push the channel into
 	// TransientFailure.
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{}})
-	for state := cc.GetState(); state != connectivity.TransientFailure; state = cc.GetState() {
-		if !cc.WaitForStateChange(ctx, state) {
-			t.Fatalf("timeout waiting for state change. got %v; want %v", state, connectivity.TransientFailure)
-		}
-	}
+	r.UpdateState(resolver.State{Endpoints: []resolver.Endpoint{}})
+	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
 
-	const msgWant = "produced zero addresses"
-	client := testpb.NewTestServiceClient(cc)
+	const msgWant = "no children to pick from"
+	client := testgrpc.NewTestServiceClient(cc)
 	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); !strings.Contains(status.Convert(err).Message(), msgWant) {
 		t.Fatalf("EmptyCall() = %v, want Contains(Message(), %q)", err, msgWant)
 	}
@@ -172,7 +130,7 @@ func (s) TestRoundRobin_AddressesRemoved(t *testing.T) {
 // TestRoundRobin_NewAddressWhileBlocking tests the case where round_robin is
 // configured on a channel, things are working as expected and then a resolver
 // updates removes all addresses. An RPC attempted at this point in time will be
-// blocked because there are no valid backends. This test verifies that when new
+// blocked because there are no valid ¡ds. This test verifies that when new
 // backends are added, the RPC is able to complete.
 func (s) TestRoundRobin_NewAddressWhileBlocking(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
@@ -182,13 +140,9 @@ func (s) TestRoundRobin_NewAddressWhileBlocking(t *testing.T) {
 	// Send a resolver update with no addresses. This should push the channel into
 	// TransientFailure.
 	r.UpdateState(resolver.State{Addresses: []resolver.Address{}})
-	for state := cc.GetState(); state != connectivity.TransientFailure; state = cc.GetState() {
-		if !cc.WaitForStateChange(ctx, state) {
-			t.Fatalf("timeout waiting for state change. got %v; want %v", state, connectivity.TransientFailure)
-		}
-	}
+	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
 
-	client := testpb.NewTestServiceClient(cc)
+	client := testgrpc.NewTestServiceClient(cc)
 	doneCh := make(chan struct{})
 	go func() {
 		// The channel is currently in TransientFailure and this RPC will block
@@ -211,8 +165,8 @@ func (s) TestRoundRobin_NewAddressWhileBlocking(t *testing.T) {
 		if len(tcs) != 1 {
 			t.Fatalf("there should only be one top channel, not %d", len(tcs))
 		}
-		started := tcs[0].ChannelData.CallsStarted
-		completed := tcs[0].ChannelData.CallsSucceeded + tcs[0].ChannelData.CallsFailed
+		started := tcs[0].ChannelMetrics.CallsStarted.Load()
+		completed := tcs[0].ChannelMetrics.CallsSucceeded.Load() + tcs[0].ChannelMetrics.CallsFailed.Load()
 		if (started - completed) == 1 {
 			break
 		}
@@ -246,7 +200,8 @@ func (s) TestRoundRobin_OneServerDown(t *testing.T) {
 	for i := 0; i < len(backends)-1; i++ {
 		addrs[i] = resolver.Address{Addr: backends[i].Address}
 	}
-	if err := checkRoundRobin(ctx, cc, addrs); err != nil {
+	client := testgrpc.NewTestServiceClient(cc)
+	if err := rrutil.CheckRoundRobinRPCs(ctx, client, addrs); err != nil {
 		t.Fatalf("RPCs are not being round robined across remaining servers: %v", err)
 	}
 }
@@ -265,17 +220,13 @@ func (s) TestRoundRobin_AllServersDown(t *testing.T) {
 		b.Stop()
 	}
 
-	// Wait for TransientFailure.
-	for state := cc.GetState(); state != connectivity.TransientFailure; state = cc.GetState() {
-		if !cc.WaitForStateChange(ctx, state) {
-			t.Fatalf("timeout waiting for state change. got %v; want %v", state, connectivity.TransientFailure)
-		}
-	}
+	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
 
 	// Failfast RPCs should fail with Unavailable.
-	client := testpb.NewTestServiceClient(cc)
-	if _, err := client.EmptyCall(context.Background(), &testpb.Empty{}); status.Code(err) == codes.Unavailable {
-		return
+	client := testgrpc.NewTestServiceClient(cc)
+
+	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("EmptyCall got err: %v; want Unavailable", err)
 	}
 }
 
@@ -317,18 +268,17 @@ func (s) TestRoundRobin_UpdateAddressAttributes(t *testing.T) {
 		grpc.WithResolvers(r),
 		grpc.WithDefaultServiceConfig(rrServiceConfig),
 	}
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", dopts...)
+	// Set an initial resolver update with no address attributes.
+	addr := resolver.Address{Addr: backend.Address}
+	r.InitialState(resolver.State{Addresses: []resolver.Address{addr}})
+	cc, err := grpc.NewClient(r.Scheme()+":///test.server", dopts...)
 	if err != nil {
-		t.Fatalf("grpc.Dial() failed: %v", err)
+		t.Fatalf("grpc.NewClient() failed: %v", err)
 	}
 	t.Cleanup(func() { cc.Close() })
 
-	// Send a resolver update with no address attributes.
-	addr := resolver.Address{Addr: backend.Address}
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{addr}})
-
 	// Make an RPC and ensure it does not contain the metadata we are looking for.
-	client := testpb.NewTestServiceClient(cc)
+	client := testgrpc.NewTestServiceClient(cc)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
